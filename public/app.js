@@ -1,6 +1,5 @@
 mdc.ripple.MDCRipple.attachTo(document.querySelector('.mdc-button'));
 
-// DEfault configuration - Change these if you have a different STUN or TURN server.
 const configuration = {
   iceServers: [
     {
@@ -28,17 +27,34 @@ async function createRoom() {
   document.querySelector('#createBtn').disabled = true;
   document.querySelector('#joinBtn').disabled = true;
   const db = firebase.firestore();
+  const roomRef = await db.collection('rooms').doc();
 
   console.log('Create PeerConnection with configuration: ', configuration);
   peerConnection = new RTCPeerConnection(configuration);
 
   registerPeerConnectionListeners();
 
-  // Add code for creating a room here
-  // Code for creating a room below
+  localStream.getTracks().forEach((track) => {
+    peerConnection.addTrack(track, localStream);
+  });
 
+  // Code for collecting ICE candidates below
+  const callerCandidatesCollection = roomRef.collection('callerCandidates');
+
+  peerConnection.addEventListener('icecandidate', (event) => {
+    if (!event.candidate) {
+      console.log('Got final candidate!');
+      return;
+    }
+    console.log('Got candidate: ', event.candidate);
+    callerCandidatesCollection.add(event.candidate.toJSON());
+  });
+  // Code for collecting ICE candidates above
+
+  // Code for creating a room below
   const offer = await peerConnection.createOffer();
   await peerConnection.setLocalDescription(offer);
+  console.log('Created offer:', offer);
 
   const roomWithOffer = {
     offer: {
@@ -46,36 +62,13 @@ async function createRoom() {
       sdp: offer.sdp,
     },
   };
-
-  console.log('Write offer');
-  const roomRef = await db.collection('rooms').add(roomWithOffer);
-  const roomId = roomRef.id;
-  console.log('roomId', roomId);
+  await roomRef.set(roomWithOffer);
+  roomId = roomRef.id;
+  console.log(`New room created with SDP offer. Room ID: ${roomRef.id}`);
   document.querySelector(
     '#currentRoom'
-  ).innerText = `Current room is ${roomId} - You are the caller!`;
-
-  roomRef.onSnapshot(async (snapshot) => {
-    console.log('Got updated room:', snapshot.data());
-    const data = snapshot.data();
-    if (!peerConnection.currentRemoteDescription && data.answer) {
-      console.log('Set remote description:', data.answer);
-      const answer = new RTCSessionDescription(data.answer);
-      peerConnection.setRemoteDescription(answer);
-    }
-  });
-
-  // Code for creating room above
-
-  localStream.getTracks().forEach((track) => {
-    peerConnection.addTrack(track, localStream);
-  });
-
+  ).innerText = `Current room is ${roomRef.id} - You are the caller!`;
   // Code for creating a room above
-
-  // Code for collecting ICE candidates below
-
-  // Code for collecting ICE candidates above
 
   peerConnection.addEventListener('track', (event) => {
     console.log('Got remote track:', event.streams[0]);
@@ -83,14 +76,31 @@ async function createRoom() {
       console.log('Add a track to the remoteStream:', track);
       remoteStream.addTrack(track);
     });
+    // 修复 Safari remoteView 不显示
+    document.querySelector('#remoteVideo').srcObject = remoteStream;
   });
 
   // Listening for remote session description below
-
+  roomRef.onSnapshot(async (snapshot) => {
+    const data = snapshot.data();
+    if (!peerConnection.currentRemoteDescription && data && data.answer) {
+      console.log('Got remote description: ', data.answer);
+      const rtcSessionDescription = new RTCSessionDescription(data.answer);
+      await peerConnection.setRemoteDescription(rtcSessionDescription);
+    }
+  });
   // Listening for remote session description above
 
   // Listen for remote ICE candidates below
-
+  roomRef.collection('calleeCandidates').onSnapshot((snapshot) => {
+    snapshot.docChanges().forEach(async (change) => {
+      if (change.type === 'added') {
+        let data = change.doc.data();
+        console.log(`Got new remote ICE candidate: ${JSON.stringify(data)}`);
+        await peerConnection.addIceCandidate(new RTCIceCandidate(data));
+      }
+    });
+  });
   // Listen for remote ICE candidates above
 }
 
@@ -128,7 +138,15 @@ async function joinRoomById(roomId) {
     });
 
     // Code for collecting ICE candidates below
-
+    const calleeCandidatesCollection = roomRef.collection('calleeCandidates');
+    peerConnection.addEventListener('icecandidate', (event) => {
+      if (!event.candidate) {
+        console.log('Got final candidate!');
+        return;
+      }
+      console.log('Got candidate: ', event.candidate);
+      calleeCandidatesCollection.add(event.candidate.toJSON());
+    });
     // Code for collecting ICE candidates above
 
     peerConnection.addEventListener('track', (event) => {
@@ -137,13 +155,16 @@ async function joinRoomById(roomId) {
         console.log('Add a track to the remoteStream:', track);
         remoteStream.addTrack(track);
       });
+      // 修复 Safari remoteView 不显示
+      document.querySelector('#remoteVideo').srcObject = remoteStream;
     });
 
     // Code for creating SDP answer below
-
     const offer = roomSnapshot.data().offer;
-    await peerConnection.setRemoteDescription(offer);
+    console.log('Got offer:', offer);
+    await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
     const answer = await peerConnection.createAnswer();
+    console.log('Created answer:', answer);
     await peerConnection.setLocalDescription(answer);
 
     const roomWithAnswer = {
@@ -152,13 +173,19 @@ async function joinRoomById(roomId) {
         sdp: answer.sdp,
       },
     };
-
     await roomRef.update(roomWithAnswer);
-
     // Code for creating SDP answer above
 
     // Listening for remote ICE candidates below
-
+    roomRef.collection('callerCandidates').onSnapshot((snapshot) => {
+      snapshot.docChanges().forEach(async (change) => {
+        if (change.type === 'added') {
+          let data = change.doc.data();
+          console.log(`Got new remote ICE candidate: ${JSON.stringify(data)}`);
+          await peerConnection.addIceCandidate(new RTCIceCandidate(data));
+        }
+      });
+    });
     // Listening for remote ICE candidates above
   }
 }
@@ -208,11 +235,11 @@ async function hangUp(e) {
     const roomRef = db.collection('rooms').doc(roomId);
     const calleeCandidates = await roomRef.collection('calleeCandidates').get();
     calleeCandidates.forEach(async (candidate) => {
-      await candidate.delete();
+      await candidate.ref.delete();
     });
     const callerCandidates = await roomRef.collection('callerCandidates').get();
     callerCandidates.forEach(async (candidate) => {
-      await candidate.delete();
+      await candidate.ref.delete();
     });
     await roomRef.delete();
   }
